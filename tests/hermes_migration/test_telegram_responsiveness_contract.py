@@ -138,3 +138,23 @@ async def test_queue_text_mode_still_acknowledges(monkeypatch):
     runner,_=busy_runner(value,monkeypatch);runner._busy_text_mode='queue'
     await runner._handle_active_session_busy_message(event(),build_session_key(lane()))
     value._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cold_processing_starts_native_typing_while_handler_waits():
+    value=adapter();typed=asyncio.Event();handler_entered=asyncio.Event();release=asyncio.Event();metadata=[]
+    async def send_typing(chat_id,metadata=None):
+        assert chat_id=='-100999'
+        assert metadata['thread_id']=='12'
+        typed.set()
+    async def handler(incoming):
+        handler_entered.set();await release.wait();return None
+    value.send_typing=send_typing;value.stop_typing=AsyncMock();value._message_handler=handler
+    task=asyncio.create_task(value._process_message_background(event(),build_session_key(lane())))
+    try:
+        await asyncio.wait_for(handler_entered.wait(),2)
+        await asyncio.wait_for(typed.wait(),2)
+        assert not task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(task,2)

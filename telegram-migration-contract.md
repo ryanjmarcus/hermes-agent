@@ -10,17 +10,17 @@ This harness makes no Telegram connection, sends no live messages, reads no cred
 - `gateway/delivery_ledger.py`: durable final-response obligations; pending/attempting/delivered states, bounded recovery, visible marker for ambiguous retransmission. It is best effort; ledger errors intentionally do not block sends. It is not a durable arbitrary job-card/action store.
 - Native Kanban: durable SQLite tasks, task/run IDs, process claim/reclaim and dispatcher lifecycle hooks. Prefer this existing owner when work must remain pending across capacity rejection or restart; do not treat the completion queue as a work-admission queue.
 - `plugins/platforms/telegram/adapter.py`: real forum topic metadata, typing, native approval/clarify keyboards and direct callback handling. Clarify/approval routing maps live on the adapter; their existence is not evidence of restart-safe buttons.
-- `hermes_cli/plugins.py`, `PluginContext.register_telegram_handler(factory)`: invoked before core handlers. Register a pattern-scoped callback (`^jobs:`), not a competing catch-all. Separate pre-handler group can implement an authenticated receipt without editing Hermes core. Authorization and topic/group gating must be equivalent to the real inbound route, and receipt must say “received”, not claim dispatch before a job exists.
+- `hermes_cli/plugins.py`, `PluginContext.register_telegram_handler(factory)`: invoked before core handlers. Register a pattern-scoped callback (`^jobs:`), not a competing catch-all. Do not add a canned receipt. Meaningful acknowledgment belongs to the coordinator using the actual task intent and a confirmed dispatch. Authorization and topic/group gating must match the real inbound route.
 
 ## Behavior measured offline
 
 Canonical command:
 
 ```
-HERMES_PYTHON=<candidate>/code/.venv/bin/python scripts/run_tests.sh tests/gateway/test_telegram_responsiveness_contract.py -j 1 --file-retries 0
+HERMES_PYTHON=<candidate>/code/.venv/bin/python scripts/run_tests.sh tests/hermes_migration/test_telegram_responsiveness_contract.py -j 1 --file-retries 0
 ```
 
-Result: **2 passed, 4 strict expected failures**. The four expected failures are unfinished migration requirements, not successful fixes.
+Result: **3 passed, 4 strict expected failures**. The four expected failures are unfinished migration requirements, not successful fixes.
 
 Passing:
 - With input queue mode and the normal busy-text route, an active worker does not prevent immediate acknowledgment; topic 12 stays attached and the worker is not interrupted.
@@ -36,9 +36,9 @@ Additional source constraint: Telegram `connect(is_reconnect=False)` documents d
 
 ## Smallest follow-on implementation
 
-1. Use the native Telegram plugin handler factory for a receipt before the normal handler and for `jobs:` callbacks. Keep the normal core approval/model-picker/clarify handlers intact. Durable receipt/action ownership should reference existing Kanban task/run IDs, not a second broad job framework.
+1. Use the native Telegram plugin handler factory for `jobs:` callbacks. Keep the normal core approval/model-picker/clarify handlers intact. Bind controls to native async delegation ID + dispatched_at + origin_session; do not add a second job engine or canned acknowledgments.
 2. Persist callback action ID, task/run revision, actor authorization scope, chat/topic and transition outcome. Consume callbacks idempotently and acknowledge callback immediately. Status/probe reads must not enqueue behind a model worker; retry must inspect actual task/branch/artifact state first.
 3. Reuse native final-delivery ledger for terminal narrative results. Wire job-card updates from Kanban lifecycle observers, with explicit recovery of outstanding card updates; do not assume the final-response ledger already covers editable cards.
 4. Prove startup update retention, restart during callback processing, unauthorized/cross-topic taps and duplicate taps, plus receipt while a real bounded child process runs, before any production switch.
 
-No runtime patch or broad framework is included in this bounded feasibility task.
+A standalone read-only plugin is now included under `telegram-job-controls/`; see INTEGRATION.md. No production installation or live Telegram activity occurred.
