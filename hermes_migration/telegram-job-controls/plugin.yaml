@@ -1,3 +1,5 @@
 name: telegram-job-controls
 version: "0.1.0"
 description: "Owner-bound read-only Details and Probe buttons for native Hermes background jobs."
+provides_hooks:
+  - post_tool_call
