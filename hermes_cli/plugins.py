@@ -224,6 +224,10 @@ VALID_HOOKS: Set[str] = {
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
     "subagent_start",
+    # Observer after durable async result persistence and native queue admission.
+    # event: native completion payload (delegation ID, dispatch attempt, origin,
+    # status and result metadata). Return value ignored; no delivery ownership.
+    "on_async_delegation_completed",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
@@ -424,6 +428,7 @@ SHELL_UNSUPPORTED_HOOKS: Set[str] = {
 #
 # Bounded hooks: timeout is fail-open (abandon/skip, agent continues).
 _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
+    "on_async_delegation_completed",
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",

@@ -23,3 +23,15 @@ Coverage includes real accepted background dispatch -> hook -> captured Telegram
 - Do **not** put these mid-turn job cards in `gateway.delivery_ledger`: native recovery of final obligations clears session `resume_pending`, which would incorrectly treat a job card as the completed answer. Hermes currently provides no equivalent native nonfinal card delivery/rebind event. A future fix needs that exact native contract, not another general worker engine.
 - Plugin enablement and a deliberate authorized bot cutover must still verify cold-start Telegram update retention. Core cold connect may drop pending updates.
 - Automatic completion edits, Retry and Merge mutations are not implemented by this read-only change. Details/Probe show current native state on demand.
+
+## Automatic terminal updates
+
+The native patch adds `on_async_delegation_completed(event=...)` after the real single/batch completion result is persisted and placed on the native completion queue. This is a bounded, best-effort observer. It cannot claim or acknowledge native result delivery. Install this native patch with the plugin; `subagent_stop` alone lacks the batch delegation ID and fires too early.
+
+The plugin edits only a confirmed card whose owner, Telegram profile/chat/topic/message, native delegation ID, `dispatched_at`, and original session match its durable receipt. It preserves the goal, renders the native terminal state/result, and retains read-only Details/Probe buttons. The displayed delivery value is the native final-result delivery snapshot, separate from card-edit confirmation. Batch summaries are included.
+
+The receipt atomically claims the first terminal edit before Telegram I/O. Duplicate events and conflicting late terminal events cannot overwrite that terminal card. A connection event and the end of initial card publication each reconcile confirmed receipts once, covering downtime and work that finished before its card existed. There is no timer, model invocation, new job record, or completion-queue consumer. Reconciliation reads native job state without changing `delivery_state`, delivery attempts, final-answer obligations, or `resume_pending`.
+
+An unavailable/ambiguous Telegram edit leaves `terminal_edit=unconfirmed` in the private receipt database and retains the native result for Details/Probe. It does not blindly retry the network mutation. Cancellation during an edit leaves `terminal_edit=attempting`, also inspectable. A conflicting late native result may still be visible through Details; the plugin does not rewrite the native job ledger to hide that evidence.
+
+Offline coverage uses the actual native completion push functions and real Telegram adapter/SDK with fake network calls: single/batch terminal results; duplication; stale attempts; completion after cancellation; restart reconciliation; failed edits with result preservation and unchanged native delivery state. No live polling, send, webhook operation, service restart, or token change was performed.

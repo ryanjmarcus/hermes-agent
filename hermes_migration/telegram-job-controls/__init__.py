@@ -104,6 +104,43 @@ class Bindings:
                     (state, json.dumps(value), key),
                 )
 
+    def confirmed_cards(self):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT card_key, receipt FROM cards").fetchall()
+        return [
+            (key, json.loads(raw))
+            for key, raw in rows
+            if json.loads(raw).get("message_id")
+        ]
+
+    def claim_terminal_edit(self, key, job):
+        """Persist edit intent before network I/O; ambiguous edits are inspectable."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT receipt FROM cards WHERE card_key=?", (key,)
+            ).fetchone()
+            if not row:
+                return False
+            receipt = json.loads(row[0])
+            if (
+                receipt.get("terminal_state")
+                or not receipt.get("message_id")
+                or receipt["attempt"] != job["dispatched_at"]
+                or receipt["source"]["session_key"] != job["origin_session"]
+            ):
+                return False
+            receipt.update(
+                terminal_state=job["state"],
+                terminal_completed_at=job.get("completed_at"),
+                terminal_edit="attempting",
+            )
+            conn.execute(
+                "UPDATE cards SET receipt=? WHERE card_key=?",
+                (json.dumps(receipt), key),
+            )
+            return True
+
 
 def native_job(job_id, probe=False):
     from tools.async_delegation import get_durable_delegation, list_async_delegations
@@ -170,6 +207,7 @@ async def attach_controls(
         "job_id": job_id,
         "attempt": job["dispatched_at"],
         "message_id": str(message_id),
+        "token": token,
     }
 
 
@@ -192,6 +230,12 @@ def render(job, probe=False):
     result = job.get("result") or {}
     if isinstance(result, dict):
         summary = result.get("summary") or result.get("error")
+        if not summary and isinstance(result.get("results"), list):
+            summary = "; ".join(
+                str(row.get("summary") or row.get("error") or row.get("status") or "")
+                for row in result["results"]
+                if isinstance(row, dict)
+            )
         if summary:
             lines.append("Result: " + str(summary)[:1200])
     if probe:
@@ -310,6 +354,84 @@ class AutomaticCards:
     def connected(self, adapter):
         owner = getattr(adapter, "_owner_profile", None) or "default"
         self.adapters[owner] = (adapter, asyncio.get_running_loop())
+        self.ctx.spawn_task(self.reconcile(adapter), name="telegram-job-card-reconnect")
+
+    def completed(self, event, **_):
+        if not isinstance(event, dict) or not event.get("delegation_id"):
+            return
+        # Destinations come exclusively from durable confirmed card receipts.
+        for adapter, loop in tuple(self.adapters.values()):
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(
+                    lambda adapter=adapter: self.ctx.spawn_task(
+                        self.reconcile(adapter, event),
+                        name="telegram-job-card-completion",
+                    )
+                )
+
+    async def reconcile(self, adapter, event=None):
+        store = Bindings()
+        for key, receipt in await asyncio.to_thread(store.confirmed_cards):
+            source = receipt["source"]
+            if (source.get("profile") or "default") != (
+                getattr(adapter, "_owner_profile", None) or "default"
+            ):
+                continue
+            if event and (
+                event.get("delegation_id") != receipt["job_id"]
+                or event.get("dispatched_at") != receipt["attempt"]
+                or event.get("session_key") != source["session_key"]
+            ):
+                continue
+            job = await asyncio.to_thread(native_job, receipt["job_id"])
+            if (
+                not job
+                or job.get("dispatched_at") != receipt["attempt"]
+                or job.get("origin_session") != source["session_key"]
+                or job.get("state") in ("running", "dispatched", "stalling")
+            ):
+                continue
+            if event and event.get("status") != job["state"]:
+                continue
+            if not adapter._is_callback_user_authorized(
+                source["user_id"],
+                chat_id=source["chat_id"],
+                chat_type=source["chat_type"],
+                thread_id=source["thread_id"] or None,
+            ):
+                continue
+            if not await asyncio.to_thread(store.claim_terminal_edit, key, job):
+                continue
+            job["title"] = receipt.get("title", "")
+            try:
+                kwargs = (
+                    {"reply_markup": keyboard(receipt["token"])}
+                    if receipt.get("token")
+                    else {}
+                )
+                await adapter._bot.edit_message_text(
+                    chat_id=int(source["chat_id"]),
+                    message_id=int(receipt["message_id"]),
+                    text=render(job),
+                    **kwargs,
+                )
+                await asyncio.to_thread(
+                    store.record_card,
+                    key,
+                    "terminal_updated",
+                    terminal_edit="confirmed",
+                )
+            except Exception as error:
+                await asyncio.to_thread(
+                    store.record_card,
+                    key,
+                    "inspection_required",
+                    terminal_edit="unconfirmed",
+                    error_type=type(error).__name__,
+                )
+                logging.getLogger(__name__).warning(
+                    "Job card edit unconfirmed (%s)", type(error).__name__
+                )
 
     def post_tool(self, tool_name, result, **_):
         if tool_name != "delegate_task":
@@ -394,9 +516,13 @@ class AutomaticCards:
                 await asyncio.to_thread(store.record_card, key, "delivery_unconfirmed")
                 return
             await asyncio.to_thread(
-                store.record_card, key, "sent", message_id=str(sent.message_id)
+                store.record_card,
+                key,
+                "sent",
+                message_id=str(sent.message_id),
+                title=title,
             )
-            await attach_controls(
+            controls = await attach_controls(
                 adapter,
                 job_id=job["delegation_id"],
                 owner_id=source["user_id"],
@@ -407,7 +533,11 @@ class AutomaticCards:
                 bindings=store,
                 title=title,
             )
-            await asyncio.to_thread(store.record_card, key, "controls_attached")
+            await asyncio.to_thread(
+                store.record_card, key, "controls_attached", token=controls["token"]
+            )
+            # A very fast worker may have completed before its send receipt existed.
+            await self.reconcile(adapter)
         except Exception as error:
             await asyncio.to_thread(
                 store.record_card,
@@ -423,6 +553,7 @@ class AutomaticCards:
 def register(ctx):
     cards = AutomaticCards(ctx)
     ctx.register_hook("post_tool_call", cards.post_tool)
+    ctx.register_hook("on_async_delegation_completed", cards.completed)
 
     def wire(application, adapter):
         from telegram.ext import CallbackQueryHandler
