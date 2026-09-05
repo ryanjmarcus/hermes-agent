@@ -21,8 +21,8 @@ Coverage includes real accepted background dispatch -> hook -> captured Telegram
 
 - Ambiguous/cancelled card sends are recorded for inspection and are not blindly replayed. Already confirmed card controls survive restart. This is not a complete restart-replay outbox for cards.
 - Do **not** put these mid-turn job cards in `gateway.delivery_ledger`: native recovery of final obligations clears session `resume_pending`, which would incorrectly treat a job card as the completed answer. Hermes currently provides no equivalent native nonfinal card delivery/rebind event. A future fix needs that exact native contract, not another general worker engine.
-- Plugin enablement and a deliberate authorized bot cutover must still verify cold-start Telegram update retention. The candidate has the explicit preserve_pending_updates option; actual backlog transfer remains a live cutover check.
-- Automatic completion edits are implemented below. Retry and Merge mutations remain unimplemented. Details/Probe show current native state on demand.
+- Plugin enablement and a deliberate authorized bot cutover must still verify cold-start Telegram update retention. Core cold connect may drop pending updates.
+- Automatic completion edits, Retry and Merge mutations are not implemented by this read-only change. Details/Probe show current native state on demand.
 
 ## Automatic terminal updates
 
