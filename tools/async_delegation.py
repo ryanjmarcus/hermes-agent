@@ -807,7 +807,7 @@ def dispatch_async_delegation(
         delegation is not monitored.
     max_async_children
         Concurrency cap. When at capacity the dispatch is REJECTED (the caller
-        should fall back to sync or tell the user) rather than queued, so a
+        must retain the request or tell the user) rather than queued, so a
         runaway model can't pile up unbounded background work.
 
     Returns

@@ -966,7 +966,7 @@ def _get_max_async_children() -> int:
     synchronous batch's parallelism and how many background delegation units
     may run at once. When at capacity, a new async dispatch is REJECTED (not
     queued) so a runaway model can't pile up unbounded background work; the
-    caller falls back to running the work synchronously.
+    caller reports rejection without running the work synchronously.
 
     A leftover ``max_async_children`` in config.yaml is ignored (the config
     migration removes it, folding a raised value into
@@ -3809,6 +3809,20 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _background_admission_rejected(reason: str, error: str, *, retryable: bool) -> str:
+    """A rejected request has no worker and no native admission queue owner."""
+    return json.dumps({
+        "status": "rejected", "mode": "background", "reason": reason,
+        "started": False, "queued": False, "retryable": retryable,
+        "error": error,
+        "note": (
+            "No subagent work ran and no automatic retry was queued. Keep this request "
+            "with its existing job owner for later admission or another supported "
+            "execution route. Do not run it inline or claim a worker is running."
+        ),
+    }, ensure_ascii=False)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -4011,21 +4025,6 @@ def delegate_task(
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
-    # Live transcripts: one pre-headered append-only log per task under
-    # cache/delegation/live/<delegation_id>/task-<n>.log so the caller can
-    # tail each child's operations while it runs (side-channel only — zero
-    # effect on message content or prompt caching). Best-effort: on failure
-    # live_paths is empty and delegation proceeds exactly as before.
-    from tools.delegation_live_log import (
-        create_live_transcripts,
-        update_manifest_statuses,
-        wrap_progress_callback,
-    )
-
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
-    )
-
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
     # set_current_session_id(child.session_id), which clobbers the
@@ -4045,6 +4044,43 @@ def delegate_task(
         _origin_ui_session_id = ""
     _origin_owner_transport, _origin_owner_session_record = (
         _capture_gateway_steer_authority(_origin_ui_session_id)
+    )
+
+    # Validate background delivery BEFORE constructing children. A requested
+    # background operation must never become blocking foreground execution.
+    _wake_sid = ""
+    if background:
+        try:
+            from gateway.session_context import async_delivery_supported
+            _async_ok = async_delivery_supported()
+        except Exception:
+            return _background_admission_rejected(
+                "delivery_capability_unavailable",
+                "Could not establish a background completion route for this session.",
+                retryable=False,
+            )
+        if not _async_ok:
+            _wake_sid = _origin_wake_sid
+            if not _wake_sid:
+                return _background_admission_rejected(
+                    "async_delivery_unsupported",
+                    "This session cannot receive a detached result and has no session id to wake.",
+                    retryable=False,
+                )
+
+    # Live transcripts: one pre-headered append-only log per task under
+    # cache/delegation/live/<delegation_id>/task-<n>.log so the caller can
+    # tail each child's operations while it runs (side-channel only — zero
+    # effect on message content or prompt caching). Best-effort: on failure
+    # live_paths is empty and delegation proceeds exactly as before.
+    from tools.delegation_live_log import (
+        create_live_transcripts,
+        update_manifest_statuses,
+        wrap_progress_callback,
+    )
+
+    live_deleg_id, live_writers, live_paths = create_live_transcripts(
+        task_list, context, model=creds.get("model"), provider=creds.get("provider")
     )
 
     # Build all child agents on the main thread (thread-safe construction).
@@ -4325,57 +4361,6 @@ def delegate_task(
         from tools.async_delegation import dispatch_async_delegation_batch
         from tools.approval import get_current_session_key
 
-        # Finite sessions cannot route a detached subagent result back to the
-        # agent after their turn/process ends. This includes stateless HTTP
-        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
-        # SYNCHRONOUS execution so the result returns in this same turn instead
-        # of handing out a handle with no durable consumer. Mirrors the
-        # pool-at-capacity inline fallback below.
-        try:
-            from gateway.session_context import async_delivery_supported
-            _async_ok = async_delivery_supported()
-        except Exception:
-            _async_ok = True
-
-        _wake_sid = ""
-        if not _async_ok:
-            # The adapter itself cannot push, but if a raw session id is
-            # bound (the API server always binds one — see
-            # ApiServerAdapter._bind_api_server_session), gateway.wake can
-            # still reach the session by self-POSTing /v1/chat/completions
-            # with that id in X-Hermes-Session-Id once the batch completes.
-            # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
-            if _wake_sid:
-                logger.info(
-                    "delegate_task: async delivery unsupported on this "
-                    "session, but a session id is bound (%s) — dispatching "
-                    "in the background and waking the session via self-post "
-                    "when it completes instead of forcing synchronous "
-                    "execution.",
-                    _wake_sid,
-                )
-                _async_ok = True
-
-        if not _async_ok:
-            logger.info(
-                "delegate_task: async delivery unsupported on this session "
-                "runtime; running the batch synchronously instead."
-            )
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "background=true is not available in this session — it cannot "
-                    "receive a detached subagent result after the turn ends (a "
-                    "one-shot runner such as `hermes -z`, a cron job, a Kanban "
-                    "worker, or a stateless HTTP endpoint). The subagent(s) ran "
-                    "SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
-
         _session_key = get_current_session_key(default="")
         try:
             from gateway.session_context import get_session_env
@@ -4502,12 +4487,12 @@ def delegate_task(
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
-                "Subagent is running in the background. You and the user can "
+                "Background delegation accepted. You and the user can "
                 "keep working; its full result re-enters the conversation as a "
                 "new message when it finishes. Do not wait or poll — just "
                 "continue."
                 if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
+                f"Background delegation accepted for {n} subagents. You "
                 f"and the user can keep working; they wait on each other and "
                 f"their consolidated results re-enter the conversation as a "
                 f"single message once ALL of them finish. Do not wait or poll "
@@ -4543,24 +4528,53 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
+        # No admission queue owns a rejected batch. Do not turn requested
+        # background work into a blocking inline run or report it as started.
+        # Children were constructed but never executed; release their resources
+        # and close spawn-requested UI/transcript entries as rejected.
+        error = dispatch.get("error", "Background delegation was not accepted.")
+        rejected_results = []
+        for index, _task, child in children:
+            entry = {"task_index": index, "status": "rejected", "error": error,
+                     "summary": None, "api_calls": 0, "duration_seconds": 0}
+            rejected_results.append(entry)
+            callback = getattr(child, "tool_progress_callback", None)
+            if callback:
+                try:
+                    callback("subagent.complete", status="rejected", preview=error,
+                             summary=error, duration_seconds=0)
+                except Exception:
+                    logger.debug("Rejected child progress finalize failed", exc_info=True)
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    child_session_id=getattr(child, "session_id", None),
+                    child_role=getattr(child, "_delegate_role", None),
+                    child_summary=None, child_status="rejected",
+                    tool_call_history=[], duration_ms=0,
+                )
+            except Exception:
+                logger.debug("Rejected child stop hook failed", exc_info=True)
+            child_id = getattr(child, "_subagent_id", None)
+            if child_id:
+                _unregister_subagent(child_id, agent=child)
+            try:
+                child.close()
+            except Exception:
+                logger.debug("Rejected child close failed", exc_info=True)
+            writer = live_writers[index] if index < len(live_writers) else None
+            if writer is not None:
+                try:
+                    writer.finalize(entry)
+                except Exception:
+                    logger.debug("Rejected live transcript finalize failed", exc_info=True)
+        update_manifest_statuses(live_deleg_id, rejected_results)
+        return _background_admission_rejected(
+            "background_admission_rejected", error, retryable=True,
         )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)

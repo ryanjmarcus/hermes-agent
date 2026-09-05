@@ -15,8 +15,8 @@ inside the child's finalize path is the wedge site the cron watchdog kills.
 
 This exercises the REAL end-to-end #86632 path: a genuine ``AIAgent`` child
 (mocked LLM client) with the skill-review trigger armed, dispatched through
-``delegate_task(background=True)`` under a session runtime where async delivery
-is unsupported (cron), forcing the synchronous fallback.
+``delegate_task(background=False)`` under a session runtime where async delivery
+is unsupported (cron), explicitly requesting synchronous execution.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ def _make_real_child():
     return child
 
 
-def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
+def test_explicit_cron_sync_returns_and_spawns_no_review_fork(monkeypatch):
     """The #86632 path: sync fallback completes AND no review fork spawns.
 
     Red on the pre-fix code: the delegated child's finalize path constructed a
@@ -130,7 +130,7 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
     def _call_delegate_task():
         # Cron declares the channel stateless (#66617): async delivery is
         # unsupported and there is no bound origin session id to wake, so
-        # delegate_task must run the batch synchronously.
+        # this explicit synchronous request runs the batch synchronously.
         with (
             patch(
                 "gateway.session_context.async_delivery_supported",
@@ -144,7 +144,7 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
             done["out"] = dt.delegate_task(
                 goal="do trivial work and finish",
                 context="cron regression #86632",
-                background=True,
+                background=False,
                 parent_agent=parent,
             )
 
