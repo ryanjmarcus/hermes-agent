@@ -1343,3 +1343,22 @@ Always set `TELEGRAM_ALLOWED_USERS` to restrict who can interact with your bot. 
 Never share your bot token publicly. If compromised, revoke it immediately via BotFather's `/revoke` command.
 
 For more details, see the [Security documentation](/user-guide/security). You can also use [DM pairing](/user-guide/messaging#dm-pairing-alternative-to-allowlists) for a more dynamic approach to user authorization.
+
+
+### Preserve pending updates during a bot handoff
+
+Cold startup normally drops queued Telegram updates. To retain messages sent
+while the bot was offline, configure:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      preserve_pending_updates: true
+```
+
+This applies to cold polling startup, webhook startup and polling-conflict
+recovery. Watcher/network reconnects always preserve pending updates. The
+option defaults to `false` for compatibility and does not weaken cold-start
+readiness checks. Stop the previous bot consumer before starting the new one;
+this option does not allow two pollers to share a bot token safely.

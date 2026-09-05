@@ -1926,6 +1926,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return default
         return bool(value)
 
+    def _should_drop_pending_updates(self, *, is_reconnect: bool = False) -> bool:
+        """Preserve an operator-requested handoff queue without weakening readiness."""
+        return not is_reconnect and not self._coerce_bool_extra(
+            "preserve_pending_updates", False
+        )
+
     def _coerce_float_extra(
         self,
         key: str,
@@ -3712,19 +3718,16 @@ class TelegramAdapter(BasePlatformAdapter):
             expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True tells Telegram to terminate any
-            # other active getUpdates sessions for this bot token.  The
-            # competing session is either a zombie from the previous
-            # gateway process (whose long-poll hasn't expired server-side
-            # yet) or our own previous retry's still-expiring session.
-            # Without this, each retry starts a new getUpdates session
-            # that immediately gets 409'd by the previous one, creating
-            # the very conflict we are trying to recover from (#75017).
+            # Preserve the existing conflict-recovery behavior by default.
+            # Operators opting into queue preservation must never lose queued
+            # user messages during a retry. The existing stop/drain, bounded
+            # retry ladder and fatal-error handoff still apply; preserving the
+            # queue does not make simultaneous pollers safe.
             self._polling_conflict_recovery_generation = expected_generation
             try:
                 await self._start_polling_once(
                     app,
-                    drop_pending_updates=True,
+                    drop_pending_updates=self._should_drop_pending_updates(),
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info(
@@ -4475,13 +4478,11 @@ class TelegramAdapter(BasePlatformAdapter):
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
 
-        ``is_reconnect`` distinguishes a cold first boot (False — drop any
-        stale Bot API queue) from a watcher reconnect after a prolonged
-        outage (True — preserve the updates Telegram queued while the bot
-        was offline, otherwise every message sent during the outage is
-        silently lost). The in-process network-error ladder and the
-        409-conflict handler already pass ``drop_pending_updates=False``
-        for the same reason; bootstrap follows suit on the reconnect path.
+        Watcher reconnects always preserve pending updates. Cold startup and
+        conflict recovery retain their default queue-dropping behavior unless
+        ``platforms.telegram.extra.preserve_pending_updates`` is enabled.
+        This option preserves the handoff queue without relaxing the cold
+        startup webhook-deletion or polling-progress readiness checks.
 
         Env vars for webhook mode::
 
@@ -4923,11 +4924,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     webhook_url=webhook_url,
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
-                    # Webhooks are push-based — Telegram does not hold a
-                    # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    # Telegram applies this to pending webhook updates too.
+                    # Use the same explicit preservation policy as polling.
+                    drop_pending_updates=self._should_drop_pending_updates(is_reconnect=is_reconnect),
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -4981,10 +4980,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 polling_started = await self._start_polling_resilient(
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Queue preservation is independent of cold-start readiness.
+                    # Watcher reconnects always preserve updates (#46621).
+                    drop_pending_updates=self._should_drop_pending_updates(is_reconnect=is_reconnect),
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
