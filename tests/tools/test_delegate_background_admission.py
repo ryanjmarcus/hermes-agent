@@ -119,3 +119,92 @@ def test_real_submit_failure_rejects_and_closes_unstarted_children(runtime, monk
     stop_hook.assert_called_once()
     assert stop_hook.call_args.args == ("subagent_stop",)
     assert stop_hook.call_args.kwargs["child_status"] == "rejected"
+
+
+@pytest.mark.parametrize("entry", ["model", "registry"])
+@pytest.mark.parametrize("threaded", [False, True])
+def test_finite_cli_rejects_model_delegation_in_execution_context(runtime, monkeypatch, entry, threaded):
+    from cli import _run_cli_agent_turn
+    from run_agent import AIAgent
+    from tools.registry import registry
+
+    parent, _, build, run = runtime
+    sc.reset_session_vars()
+    monkeypatch.setenv("HERMES_SESSION_ID", "finite-cli-has-id-but-no-delivery-owner")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    sc._SESSION_ASYNC_DELIVERY.set(sc._UNSET)
+    engaged_before = sc._session_context_engaged
+    observed = {}
+    args = {"goal": "fixture work", "background": False, "max_iterations": 1}
+
+    def model_turn(**kwargs):
+        assert sc.async_delivery_supported() is False
+        if entry == "model":
+            return AIAgent._dispatch_delegate_task(parent, args)
+        return registry.dispatch("delegate_task", args, parent_agent=parent)
+
+    cli = SimpleNamespace(_single_query_mode=True, agent=SimpleNamespace(run_conversation=model_turn))
+    def turn():
+        try:
+            observed["result"] = json.loads(_run_cli_agent_turn(cli, user_message="fixture"))
+            observed["delivery_after"] = sc.async_delivery_supported()
+        except BaseException as exc:
+            observed["exception"] = exc
+
+    if threaded:
+        worker = threading.Thread(target=turn, daemon=True)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive(), "finite admission must return without waiting for a child"
+    else:
+        turn()
+    assert "exception" not in observed, observed.get("exception")
+    result = observed["result"]
+    assert result["status"] == "rejected"
+    assert result["reason"] == "async_delivery_unsupported"
+    assert result["started"] is False and result["queued"] is False
+    assert observed["delivery_after"] is True
+    assert sc.async_delivery_supported() is True
+    assert sc._session_context_engaged is engaged_before
+    build.assert_not_called()
+    run.assert_not_called()
+    assert not ad._records
+
+
+@pytest.mark.parametrize("owner", ["interactive", "telegram", "api_server"])
+@pytest.mark.parametrize("entry", ["model", "registry"])
+def test_model_dispatch_with_surviving_owner_still_admits(runtime, monkeypatch, owner, entry):
+    from cli import _run_cli_agent_turn
+    from run_agent import AIAgent
+    from tools.registry import registry
+
+    parent, _, build, _ = runtime
+    entered, release = threading.Event(), threading.Event()
+    def child_run(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return {"task_index": 0, "status": "completed", "summary": "fixture completed",
+                "api_calls": 0, "duration_seconds": 0, "model": "test-model"}
+    monkeypatch.setattr(dt, "_run_single_child", child_run)
+    sc.set_session_vars(platform="api_server" if owner == "api_server" else "telegram",
+        chat_id="surviving-owner", session_id="admission-parent", session_key="admission-parent",
+        async_delivery=owner != "api_server")
+    args = {"goal": "fixture work", "background": False}
+    def model_turn(**kwargs):
+        if entry == "model":
+            return AIAgent._dispatch_delegate_task(parent, args)
+        return registry.dispatch("delegate_task", args, parent_agent=parent)
+    try:
+        if owner == "interactive":
+            cli = SimpleNamespace(_single_query_mode=False, agent=SimpleNamespace(run_conversation=model_turn))
+            result = json.loads(_run_cli_agent_turn(cli, user_message="fixture"))
+        else:
+            result = json.loads(model_turn())
+        assert result["status"] == "dispatched"
+        assert entered.wait(5)
+        assert not release.is_set()  # foreground returned while admitted work is still running
+        build.assert_called_once()
+        assert len(ad._records) == 1
+    finally:
+        release.set()

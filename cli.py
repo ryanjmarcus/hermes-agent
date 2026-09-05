@@ -1429,6 +1429,26 @@ def _flush_one_shot_session_store(cli) -> None:
         logger.debug("one-shot end_session failed", exc_info=True)
 
 
+def _run_cli_agent_turn(cli, **kwargs):
+    """Run a model turn with this CLI session's actual delivery lifetime.
+
+    Non-quiet chat runs in a plain thread, so binding this only in main() loses
+    the capability before model-facing tool dispatch. A copied context also
+    prevents a finite turn from changing another session's delivery contract.
+    """
+    if not getattr(cli, "_single_query_mode", False):
+        return cli.agent.run_conversation(**kwargs)
+
+    from contextvars import copy_context
+    from gateway.session_context import declare_stateless_channel
+
+    def run():
+        declare_stateless_channel()
+        return cli.agent.run_conversation(**kwargs)
+
+    return copy_context().run(run)
+
+
 def _wait_for_oneshot_background_completions(cli) -> None:
     """Bounded linger for notify_on_complete background processes (#90879).
 
@@ -17153,7 +17173,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
-                    result = self.agent.run_conversation(
+                    result = _run_cli_agent_turn(
+                        self,
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
@@ -21564,7 +21585,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
+        result = _run_cli_agent_turn(
+            cli,
             user_message=prompt,
             conversation_history=cli.conversation_history,
         )
@@ -22155,7 +22177,8 @@ def main(
                         # from display.tool_progress at construction).
                         cli.agent.tool_progress_mode = "off"
                         try:
-                            result = cli.agent.run_conversation(
+                            result = _run_cli_agent_turn(
+                                cli,
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )

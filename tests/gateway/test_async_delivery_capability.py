@@ -89,64 +89,33 @@ class TestDeclareStatelessChannel:
             reset_session_vars()
 
 
-class TestStatelessChannelForcesSyncDelegation:
-    """The behavioral contract: a stateless channel must run delegations INLINE.
+class TestStatelessChannelRejectsBackgroundDelegation:
+    """A finite channel cannot own detached work or silently run it inline."""
 
-    This is the regression that #53027 / #63142 describe — a background dispatch
-    on a channel that can never deliver the completion.
-    """
-
-    def test_background_delegation_runs_inline_when_channel_is_stateless(
-        self, monkeypatch
-    ):
+    def test_background_delegation_rejected_when_channel_is_stateless(self, monkeypatch):
+        from unittest.mock import Mock
+        from types import SimpleNamespace
         import tools.delegate_tool as dt
         from gateway.session_context import declare_stateless_channel
 
-        class _Parent:
-            _delegate_depth = 0
-            _subagent_id = None
-
-        fake_child = type("C", (), {"_subagent_id": "s1"})()
-        dispatched = []
-
-        def _fake_dispatch(*a, **kw):
-            dispatched.append(kw)
-            return {"delegation_id": "deleg_x"}
-
-        def _child(task_index, goal, child=None, parent_agent=None, **kw):
-            return {
-                "task_index": 0, "status": "completed", "summary": f"done: {goal}",
-                "api_calls": 1, "duration_seconds": 0.1, "model": "m",
-                "exit_reason": "completed",
-            }
-
-        creds = {
-            "model": "m", "provider": None, "base_url": None, "api_key": None,
-            "api_mode": None, "command": None, "args": None,
-        }
-        monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
-        monkeypatch.setattr(dt, "_run_single_child", _child)
-        monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-        monkeypatch.setattr(
-            "tools.async_delegation.dispatch_async_delegation_batch", _fake_dispatch
-        )
-
+        build = Mock(side_effect=AssertionError("No child should be constructed"))
+        run = Mock(side_effect=AssertionError("No inline execution"))
+        monkeypatch.setattr(dt, "_build_child_agent", build)
+        monkeypatch.setattr(dt, "_run_single_child", run)
         reset_session_vars()
         try:
             declare_stateless_channel()
-            out = dt.delegate_task(
-                goal="review the spec", background=True, parent_agent=_Parent()
-            )
+            result = json.loads(dt.delegate_task(
+                goal="review the spec", background=True,
+                parent_agent=SimpleNamespace(_delegate_depth=0, _subagent_id=None),
+            ))
         finally:
             reset_session_vars()
-
-        parsed = json.loads(out)
-        # The whole point: NOT dispatched to a channel that can't deliver.
-        assert not dispatched, "stateless channel must not dispatch a detached child"
-        assert parsed.get("status") != "dispatched"
-        # The caller gets the actual work product, in-turn.
-        assert "results" in parsed
-        assert "done: review the spec" in json.dumps(parsed)
+        assert result["status"] == "rejected"
+        assert result["reason"] == "async_delivery_unsupported"
+        assert result["started"] is False and result["queued"] is False
+        build.assert_not_called()
+        run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

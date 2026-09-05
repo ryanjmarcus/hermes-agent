@@ -483,10 +483,9 @@ def declare_stateless_channel() -> None:
     Callers that already build a full session context (cron's ``run_job``) get
     the same state by passing ``async_delivery=False`` to ``set_session_vars``.
 
-    A session that cannot take a late completion makes ``delegate_task`` fall
-    through to its existing inline/synchronous path, so subagent results are
-    returned within the turn instead of being dispatched to a channel that will
-    never deliver them.
+    A session that cannot take a late completion makes background ``delegate_task``
+    reject admission unless the API server has a bound session wake target.
+    Rejection does not run the work inline or claim that a retry was queued.
 
     See NousResearch/hermes-agent#53027 and #63142.
     """
