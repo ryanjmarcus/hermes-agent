@@ -945,16 +945,6 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         _prune_completed_locked()
 
 
-def _notify_completion_observers(event: Dict[str, Any]) -> None:
-    """Observe a persisted result without claiming its native delivery obligation."""
-    try:
-        from hermes_cli.plugins import has_hook, invoke_hook
-        if has_hook("on_async_delegation_completed"):
-            invoke_hook("on_async_delegation_completed", event=dict(event))
-    except Exception:
-        logger.debug("Async delegation completion observer failed", exc_info=True)
-
-
 def _push_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
 ) -> None:
@@ -1022,7 +1012,6 @@ def _push_completion_event(
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
-        _notify_completion_observers(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
@@ -1237,7 +1226,6 @@ def _push_batch_completion_event(
     _persist_completion(evt, combined)
     try:
         process_registry.completion_queue.put(evt)
-        _notify_completion_observers(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "

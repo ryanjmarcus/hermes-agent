@@ -156,10 +156,6 @@ async def test_slow_probe_answers_callback_first_and_never_multiplies_readers(tm
 @pytest.mark.asyncio
 async def test_register_uses_native_pattern_scoped_factory():
     ctx = MagicMock()
-    pending = []
-    ctx.spawn_task.side_effect = lambda coro, **kw: pending.append(
-        asyncio.create_task(coro)
-    )
     jobs.register(ctx)
     factory = ctx.register_telegram_handler.call_args.args[0]
     app = MagicMock()
@@ -168,7 +164,6 @@ async def test_register_uses_native_pattern_scoped_factory():
     assert handler.pattern.match("jobs:p:abc")
     assert not handler.pattern.match("ea:once:5")
     assert not handler.pattern.match("cl:question:0")
-    await asyncio.gather(*pending)
 
 
 @pytest.mark.asyncio
@@ -314,8 +309,7 @@ async def test_rejected_or_unbound_dispatch_cannot_post_using_environment_destin
         },
     )
     await asyncio.sleep(0)
-    await asyncio.gather(*ctx.tasks)
-    assert all(task.get_name() == "telegram-job-card-reconnect" for task in ctx.tasks)
+    assert ctx.tasks == []
 
 
 @pytest.mark.asyncio
@@ -365,163 +359,3 @@ def test_details_preserve_goal_native_timestamps_and_result():
         "delivered",
     ):
         assert expected in output
-
-
-def card_fixture(store, record):
-    source = dict(
-        platform="telegram",
-        profile="",
-        chat_id="-100999",
-        chat_type="supergroup",
-        thread_id="12",
-        user_id="777",
-        session_key="telegram-topic-12",
-    )
-    key = store.claim_card(record, source)
-    token = issue(store, {**record, "title": "Fix verified sale copy"})
-    store.record_card(
-        key,
-        "controls_attached",
-        message_id="501",
-        token=token,
-        title="Fix verified sale copy",
-    )
-    return key
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,batch", [("completed", False), ("error", True), ("cancelled", False)]
-)
-async def test_native_completion_observer_updates_confirmed_card_without_consuming_delivery(
-    monkeypatch, status, batch
-):
-    from hermes_cli import plugins
-
-    store = jobs.Bindings()
-    record = native_record()
-    card_fixture(store, record)
-    adapter = make_adapter()
-    adapter._bot = AsyncMock()
-    ctx = PluginContext()
-    cards = jobs.AutomaticCards(ctx)
-    cards.connected(adapter)
-    await asyncio.gather(*ctx.tasks)
-    observed = []
-
-    def observe(name, *, event):
-        assert name == "on_async_delegation_completed"
-        assert ad.get_durable_delegation(event["delegation_id"])["state"] == status
-        observed.append(event)
-        cards.completed(event)
-
-    monkeypatch.setattr(
-        plugins, "has_hook", lambda name: name == "on_async_delegation_completed"
-    )
-    monkeypatch.setattr(plugins, "invoke_hook", observe)
-    native = {
-        "delegation_id": record["delegation_id"],
-        "session_key": record["origin_session"],
-        "dispatched_at": record["dispatched_at"],
-        "completed_at": 1300,
-        "goal": "fixture",
-    }
-    result = (
-        {"results": [{"summary": "Verified result preserved"}]}
-        if batch
-        else {"summary": "Verified result preserved"}
-    )
-    push = ad._push_batch_completion_event if batch else ad._push_completion_event
-    await asyncio.to_thread(push, native, result, status)
-    await asyncio.sleep(0)
-    await asyncio.gather(*ctx.tasks)
-    assert len(observed) == 1
-    args = adapter._bot.edit_message_text.call_args.kwargs
-    assert args["chat_id"] == -100999 and args["message_id"] == 501
-    assert (
-        "Fix verified sale copy" in args["text"]
-        and "Verified result preserved" in args["text"]
-    )
-    saved = ad.get_durable_delegation(record["delegation_id"])
-    assert saved["delivery_state"] == "pending" and saved["delivery_attempts"] == 0
-    assert saved["result"] == result
-    # Duplicate notification and reconstructed plugin cannot edit the card again.
-    await cards.reconcile(adapter, observed[0])
-    restarted = jobs.AutomaticCards(PluginContext())
-    await restarted.reconcile(adapter, observed[0])
-    assert adapter._bot.edit_message_text.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_old_attempt_or_late_success_cannot_overwrite_cancelled_card():
-    store = jobs.Bindings()
-    record = native_record()
-    card_fixture(store, record)
-    adapter = make_adapter()
-    adapter._bot = AsyncMock()
-    cards = jobs.AutomaticCards(PluginContext())
-    event = dict(
-        delegation_id="offline-job",
-        session_key="telegram-topic-12",
-        dispatched_at=1234,
-        completed_at=1300,
-        status="cancelled",
-    )
-    ad._persist_completion(event, {"summary": "Cancelled"})
-    await cards.reconcile(adapter, {**event, "dispatched_at": 1220})
-    adapter._bot.edit_message_text.assert_not_awaited()
-    await cards.reconcile(adapter, event)
-    # Even a late native write cannot overwrite the already-confirmed terminal card.
-    ad._persist_completion({**event, "status": "completed"}, {"summary": "late result"})
-    await cards.reconcile(adapter, {**event, "status": "completed"})
-    assert adapter._bot.edit_message_text.await_count == 1
-    assert "cancelled" in adapter._bot.edit_message_text.call_args.kwargs["text"]
-
-
-@pytest.mark.asyncio
-async def test_failed_terminal_edit_preserves_native_result_for_details_and_no_blind_replay():
-    store = jobs.Bindings()
-    record = native_record()
-    card_fixture(store, record)
-    adapter = make_adapter()
-    adapter._bot = AsyncMock()
-    adapter._bot.edit_message_text.side_effect = TimeoutError("offline transport")
-    event = dict(
-        delegation_id="offline-job",
-        session_key="telegram-topic-12",
-        dispatched_at=1234,
-        completed_at=1300,
-        status="completed",
-    )
-    ad._persist_completion(event, {"summary": "PR result remains available"})
-    before = ad.get_durable_delegation("offline-job")
-    cards = jobs.AutomaticCards(PluginContext())
-    await cards.reconcile(adapter, event)
-    await jobs.AutomaticCards(PluginContext()).reconcile(adapter, event)
-    assert adapter._bot.edit_message_text.await_count == 1
-    assert ad.get_durable_delegation("offline-job") == before
-    receipt = store.confirmed_cards()[0][1]
-    assert receipt["terminal_edit"] == "unconfirmed"
-    tapped = update(receipt["token"])
-    await jobs.Controller(adapter, store).handle(tapped, None)
-    assert (
-        "PR result remains available"
-        in tapped.callback_query.edit_message_text.call_args.args[0]
-    )
-
-
-@pytest.mark.asyncio
-async def test_reconnect_catches_completion_missed_while_adapter_absent():
-    store = jobs.Bindings()
-    record = native_record()
-    card_fixture(store, record)
-    ad._persist_completion(
-        dict(delegation_id="offline-job", status="completed", completed_at=1300),
-        {"summary": "done"},
-    )
-    adapter = make_adapter()
-    adapter._bot = AsyncMock()
-    ctx = PluginContext()
-    jobs.AutomaticCards(ctx).connected(adapter)
-    await asyncio.gather(*ctx.tasks)
-    assert adapter._bot.edit_message_text.await_count == 1
