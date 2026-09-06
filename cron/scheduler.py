@@ -5116,7 +5116,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     )
     model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
-    from hermes_cli.auth import AuthError
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -5126,6 +5126,11 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
             kwargs["explicit_base_url"] = job.get("base_url")
         resolve_runtime_provider(**kwargs)
     except AuthError as exc:
+        if is_rate_limited_auth_error(exc):
+            return (
+                "provider usage limit reached (429); credentials remain valid. "
+                "Restore available quota or use an already authorized, funded provider."
+            )
         return (
             f"provider credential missing: {exc}. "
             "Set the provider API key in .env (or `hermes setup`), or pin a "
