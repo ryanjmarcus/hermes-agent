@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -12,6 +14,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import cron.incidents as incidents
 import cron.jobs as cron_jobs
 import cron.scheduler as sched
+
+
+def _migrate_legacy_schema_worker(db_path: str, start, results) -> None:
+    """Separate process: exercise migration without the module-local RLock."""
+    incidents.EXECUTIONS_FILE = Path(db_path)
+    start.wait(timeout=10)
+    try:
+        results.put(("ok", incidents.count_incidents()))
+    except Exception as exc:  # pragma: no cover - asserted in parent
+        results.put(("error", repr(exc)))
 
 
 def _point_db(monkeypatch, tmp_path):
@@ -204,6 +216,44 @@ def test_acked_signature_stays_closed_on_refresh(monkeypatch, tmp_path):
     assert inc.get_incident(inc_id)["state"] == "closed"
 
 
+def test_success_resolves_active_incidents_and_recurrence_reopens(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    first_id, _ = inc.upsert_incident("job-1", "same failure text")
+    inc.set_incident_state(first_id, "alerted")
+    closed_id, _ = inc.upsert_incident("job-1", "operator acked failure")
+    inc.ack_incident(closed_id)
+    other_id, _ = inc.upsert_incident("job-2", "other failure")
+
+    assert inc.resolve_job_incidents("job-1") == 1
+    resolved = inc.get_incident(first_id)
+    closed = inc.get_incident(closed_id)
+    other = inc.get_incident(other_id)
+    assert resolved is not None
+    assert closed is not None
+    assert other is not None
+    assert resolved["state"] == "resolved"
+    assert resolved["resolved_at"]
+    assert closed["state"] == "closed"
+    assert other["state"] == "detected"
+
+    same_id, is_new = inc.upsert_incident("job-1", "SAME FAILURE TEXT")
+    assert same_id == first_id
+    assert is_new is True
+    reopened = inc.get_incident(first_id)
+    assert reopened is not None
+    assert reopened["state"] == "detected"
+    assert reopened["resolved_at"] is None
+
+
+def test_scheduler_success_resolution_is_best_effort():
+    with patch("cron.incidents.resolve_job_incidents") as resolve:
+        sched._resolve_incidents_after_success("job-1")
+    resolve.assert_called_once_with("job-1")
+
+    with patch("cron.incidents.resolve_job_incidents", side_effect=RuntimeError("db locked")):
+        sched._resolve_incidents_after_success("job-1")
+
+
 # ── Missing DB / lazy schema ───────────────────────────────────────────────
 
 
@@ -217,6 +267,41 @@ def test_missing_db_no_crash(monkeypatch, tmp_path):
     assert inc.list_incidents() == [inc.get_incident(inc_id)]
     assert inc.count_incidents() == 1
     assert inc.get_incident("nope") is None
+
+
+def test_legacy_schema_migration_is_safe_across_processes(monkeypatch, tmp_path):
+    db_path = tmp_path / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """CREATE TABLE cron_incidents (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, error_sig TEXT NOT NULL,
+                 state TEXT NOT NULL, failure_type TEXT NOT NULL DEFAULT 'unknown',
+                 first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                 acked_at TEXT, closed_at TEXT, error TEXT NOT NULL, output_file TEXT
+               )"""
+        )
+
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    workers = [
+        ctx.Process(target=_migrate_legacy_schema_worker, args=(str(db_path), start, results))
+        for _ in range(4)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    outcomes = [results.get(timeout=15) for _ in workers]
+    for worker in workers:
+        worker.join(timeout=15)
+        assert worker.exitcode == 0
+
+    assert outcomes == [("ok", 0)] * 4
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(cron_incidents)")}
+    assert "resolved_at" in columns
 
 
 # ── Scheduler gating ───────────────────────────────────────────────────────

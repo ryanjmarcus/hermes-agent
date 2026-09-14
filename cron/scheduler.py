@@ -519,6 +519,16 @@ def _mark_incident_alerted(incident_id: Optional[str]) -> None:
         logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
 
 
+def _resolve_incidents_after_success(job_id: str) -> None:
+    """Best-effort resolution of stale failure incidents after a clean run."""
+    try:
+        from cron.incidents import resolve_job_incidents
+
+        resolve_job_incidents(job_id)
+    except Exception as exc:
+        logger.debug("Failed resolving incidents for job %s: %s", job_id, exc)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -7527,6 +7537,8 @@ def _run_one_job_body(
                 error="Fire claim ownership lost before terminal completion.",
             )
             return True
+        if marked and success and not delivery_error:
+            _resolve_incidents_after_success(job["id"])
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"

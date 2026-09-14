@@ -5,7 +5,7 @@ groups the *failures* into durable incidents keyed by ``(job_id, error
 signature)`` so the same job failing with the same error does not re-ping the
 operator every run once they have acknowledged it.
 
-Lifecycle: ``detected`` → ``alerted`` → ``closed``. Closing
+Lifecycle: ``detected`` → ``alerted`` → ``resolved`` or ``closed``. Closing
 (acking) an incident is per-signature: the same job + same normalized error
 keeps resolving to the SAME incident id, so a closed incident stays closed (no
 re-alert) until the error text changes, which mints a brand-new incident.
@@ -36,7 +36,7 @@ from hermes_time import now as _hermes_now
 # Optional test override (mirrors ``cron.executions.EXECUTIONS_FILE``).
 EXECUTIONS_FILE: Optional[Path] = None
 
-INCIDENT_STATES = ("detected", "alerted", "closed")
+INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
@@ -98,10 +98,20 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              last_seen_at  TEXT NOT NULL,
              acked_at      TEXT,
              closed_at     TEXT,
+             resolved_at   TEXT,
              error         TEXT NOT NULL,
              output_file   TEXT
            )"""
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(cron_incidents)")}
+    if "resolved_at" not in columns:
+        # Serialize the one-time legacy migration across scheduler processes.
+        # Recheck after taking the database write lock: another process may
+        # have added the column while this connection waited.
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(cron_incidents)")}
+        if "resolved_at" not in columns:
+            conn.execute("ALTER TABLE cron_incidents ADD COLUMN resolved_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cron_incidents_job "
         "ON cron_incidents(job_id)"
@@ -185,9 +195,10 @@ def upsert_incident(
     """Record (or refresh) the incident for ``job_id`` + ``error``.
 
     Returns ``(incident_id, is_new)``. A row for the same signature already
-    existing refreshes ``last_seen_at``/``error``/``output_file`` and keeps its
-    current state — a ``closed`` (acked) incident stays closed for the same
-    signature. A changed error text mints a new incident automatically.
+    existing refreshes ``last_seen_at``/``error``/``output_file``. A resolved
+    incident reopens for a real recurrence; a ``closed`` (operator-acked)
+    incident stays closed for the same signature. A changed error text mints a
+    new incident automatically.
     """
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
@@ -199,9 +210,19 @@ def upsert_incident(
 
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT id FROM cron_incidents WHERE id=?", (incident_id,)
+            "SELECT id, state FROM cron_incidents WHERE id=?", (incident_id,)
         ).fetchone()
         if row is not None:
+            if row["state"] == "resolved":
+                conn.execute(
+                    """UPDATE cron_incidents
+                       SET state='detected', first_seen_at=?, last_seen_at=?,
+                           acked_at=NULL, closed_at=NULL, resolved_at=NULL,
+                           failure_type=?, error=?, output_file=?
+                       WHERE id=?""",
+                    (now, now, failure_type, stored_error, output_file, incident_id),
+                )
+                return incident_id, True
             conn.execute(
                 """UPDATE cron_incidents
                    SET last_seen_at=?, error=?, output_file=?
@@ -245,6 +266,13 @@ def set_incident_state(incident_id: str, state: str) -> bool:
                    WHERE id=? AND state != 'closed'""",
                 (now, now, incident_id),
             )
+        elif state == "resolved":
+            conn.execute(
+                """UPDATE cron_incidents
+                   SET state='resolved', resolved_at=?
+                   WHERE id=? AND state != 'closed'""",
+                (now, incident_id),
+            )
         else:
             conn.execute(
                 "UPDATE cron_incidents SET state=? WHERE id=?",
@@ -259,6 +287,22 @@ def ack_incident(incident_id: str) -> bool:
     A no-op (``False``) when the incident does not exist or is already closed.
     """
     return set_incident_state(incident_id, "closed")
+
+
+def resolve_job_incidents(job_id: str) -> int:
+    """Resolve active incidents after success; recurrence reopens and alerts."""
+    job_id = str(job_id or "")
+    if not job_id:
+        return 0
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE cron_incidents
+               SET state='resolved', resolved_at=?
+               WHERE job_id=? AND state IN ('detected', 'alerted')""",
+            (now, job_id),
+        )
+        return int(cursor.rowcount)
 
 
 def list_incidents(state: Optional[str] = None) -> List[Dict[str, Any]]:
