@@ -518,6 +518,24 @@ def _is_openai_codex_backend(agent) -> bool:
     return classify_responses_route(agent).is_codex_backend
 
 
+def codex_event_stale_timeout_default(est_tokens: int) -> float:
+    """Default gap allowed between Codex SSE events by context size.
+
+    Small requests use a 30-second floor: 12 seconds is shorter than normal
+    transient backend scheduling/read gaps and caused false retries after the
+    stream had already started. Larger requests retain progressively longer
+    allowances for admission and prefill. The environment override is applied
+    at the call site below.
+    """
+    if est_tokens > 100_000:
+        return 180.0
+    if est_tokens > 50_000:
+        return 120.0
+    if est_tokens > 10_000:
+        return 60.0
+    return 30.0
+
+
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     """Minimum wall-clock stale timeout for openai-codex by estimated context.
 
@@ -1534,17 +1552,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     ):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
-    if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
-    elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
-    elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
-    else:
-        _codex_idle_timeout_default = 12.0
+    _codex_idle_timeout_default = codex_event_stale_timeout_default(
+        _est_tokens_for_codex_watchdog
+    )
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
-    # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
+    # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a short default
     # killed subscription-backed Codex requests mid-prefill before the backend
     # had a chance to emit its first SSE event. Default to 120s — long enough to
     # clear normal backend admission / prompt prefill, short enough to still

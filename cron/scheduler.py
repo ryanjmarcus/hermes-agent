@@ -5676,6 +5676,7 @@ def run_job(
     from cron.monitor import check_monitor, job_has_monitor
 
     _monitor_context: Optional[str] = None
+    _monitor_pending_state = None
     if job_has_monitor(job):
         _mon = check_monitor(job)
         _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -5718,6 +5719,7 @@ def run_job(
         # through the existing per-run context seam and fall through to a
         # normal agent run.
         _monitor_context = _mon.context_block
+        _monitor_pending_state = _mon
         if _monitor_context:
             extra_prompt = (
                 f"{_monitor_context}\n\n{extra_prompt}" if extra_prompt else _monitor_context
@@ -6765,6 +6767,21 @@ def run_job(
             "duration_ms": _audit_duration_ms,
             "error": None,
         })
+        # Commit monitor state only after the agent produced a successful
+        # result. If inference/retries fail, the next tick must retry the
+        # same changed output rather than suppressing it as unchanged.
+        if _monitor_pending_state is not None:
+            from cron.monitor import _persist_monitor_state
+
+            if (
+                _monitor_pending_state.output_hash is not None
+                and _monitor_pending_state.output is not None
+            ):
+                _persist_monitor_state(
+                    job_id,
+                    _monitor_pending_state.output_hash,
+                    _monitor_pending_state.output,
+                )
         return True, output, final_response, None
 
     except Exception as e:

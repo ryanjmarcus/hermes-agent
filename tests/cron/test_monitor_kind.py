@@ -58,7 +58,7 @@ def _write_script(home, name: str, body: str) -> str:
     return name
 
 
-def _install_agent_stubs(monkeypatch, observed: dict):
+def _install_agent_stubs(monkeypatch, observed: dict, *, fail_first: bool = False):
     """Stub the agent machinery so run_job's LLM path executes without creds.
 
     ``observed["prompts"]`` collects the prompt each agent run received;
@@ -76,6 +76,8 @@ def _install_agent_stubs(monkeypatch, observed: dict):
         def run_conversation(self, prompt, *_a, **_kw):
             observed["agent_runs"] += 1
             observed["prompts"].append(prompt)
+            if fail_first and observed["agent_runs"] == 1:
+                return {"failed": True, "error": "simulated agent failure"}
             return {"final_response": "agent done", "messages": []}
 
         def get_activity_summary(self):
@@ -334,6 +336,48 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     assert "-state A" in prompt
     assert "+state B" in prompt
     assert "state B" in prompt  # new output included verbatim
+
+
+def test_changed_output_retries_after_agent_failure(hermes_env, monkeypatch):
+    """A failed agent run must not consume the changed monitor observation."""
+    from cron.jobs import get_job
+    from cron.scheduler import run_job
+
+    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    assert run_job(job)[0] is True
+    stored_hash = get_job(job["id"])["monitor_state"]["last_output_hash"]
+
+    _write_script(hermes_env, "mon.sh", "echo 'state B'\\n")
+    job = get_job(job["id"])
+    observed.clear()
+    _install_agent_stubs(monkeypatch, observed, fail_first=True)
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert "simulated agent failure" in error
+    assert get_job(job["id"])["monitor_state"]["last_output_hash"] == stored_hash
+    assert observed["agent_runs"] == 1
+
+    # The same changed output is presented again on the next tick.
+    job = get_job(job["id"])
+    observed.clear()
+    _install_agent_stubs(monkeypatch, observed)
+    success, _doc, _final, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert observed["agent_runs"] == 1
+    assert "state B" in observed["prompts"][0]
+    assert get_job(job["id"])["monitor_state"]["last_output_hash"] != stored_hash
+
+    from cron.scheduler import SILENT_MARKER
+
+    job = get_job(job["id"])
+    success, _doc, final, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert final == SILENT_MARKER
 
 
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
